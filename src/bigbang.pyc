@@ -1,0 +1,123 @@
+import numpy as np
+import random
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Generate events
+def generate_events(N=10000, m_past=1, m_present=1, m_future=1, seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    A_p, A_pr, A_f = {}, {}, {}
+    A_p[0], A_pr[0], A_f[0] = [], [], []
+    for e in range(1, N):
+        candidates = list(range(e))
+        A_p[e] = random.sample(candidates, min(m_past, len(candidates))) if m_past > 0 else []
+        A_pr[e] = random.sample(candidates, min(m_present, len(candidates))) if m_present > 0 else []
+        A_f[e] = random.sample(candidates, min(m_future, len(candidates))) if m_future > 0 else []
+    return A_p, A_pr, A_f
+
+# Compute ρ
+def compute_rho(e1, e2, A_p, A_pr, A_f, N):
+    # Ancestry: shared past/present parents (J_anc)
+    anc1 = set(A_p.get(e1, []) + A_pr.get(e1, []))
+    anc2 = set(A_p.get(e2, []) + A_pr.get(e2, []))
+    j_anc = len(anc1 & anc2) / len(anc1 | anc2) if anc1 or anc2 else 0
+    # Future: shared future (J_fut)
+    fut1 = set(A_f.get(e1, []))
+    fut2 = set(A_f.get(e2, []))
+    j_fut = len(fut1 & fut2) / len(fut1 | fut2) if fut1 or fut2 else 0
+    # Layer: normalized |layer1 - layer2| / N (S_layer ~1 if close)
+    s_layer = 1 - abs(e1 - e2) / N
+    rho = (1/3) * j_anc + (1/3) * j_fut + (1/3) * s_layer
+    return rho
+
+# Build thresholded graph with limited range for scalability
+def build_thresholded_graph(A_p, A_pr, A_f, theta=0.5, range_limit=100):
+    G = nx.DiGraph()
+    events = list(A_p.keys())
+    N = len(events)
+    for i, e1 in enumerate(events):
+        start = max(0, i - range_limit)
+        end = min(N, i + range_limit + 1)
+        for e2 in events[start:end]:
+            if e1 != e2:
+                rho = compute_rho(e1, e2, A_p, A_pr, A_f, N)
+                if rho >= theta:
+                    etype = []
+                    if e1 in A_p.get(e2, []): etype.append("past")
+                    if e1 in A_pr.get(e2, []): etype.append("present")
+                    if e1 in A_f.get(e2, []): etype.append("future")
+                    min_e, max_e = min(e1, e2), max(e1, e2)
+                    G.add_edge(min_e, max_e, weight=rho, etype=",".join(etype) or "correlated")
+    return G
+
+# Count triangles
+def count_triangles_exact(G):
+    UG = G.to_undirected()
+    return sum(nx.triangles(UG).values()) // 3
+
+# Spectral dimension flow
+def spectral_dimension_flow(G, steps=20, trials=200, window=4):
+    nodes = list(G.nodes())
+    rng = np.random.default_rng()
+    P_ret = []
+    for t in range(1, steps+1):
+        count = 0
+        for _ in range(trials):
+            start = rng.choice(nodes)
+            current = start
+            for _ in range(t):
+                nbrs = list(G.successors(current)) + list(G.predecessors(current))
+                if not nbrs:
+                    break
+                current = rng.choice(nbrs)
+            if current == start:
+                count += 1
+        P_val = count / trials
+        if P_val == 0:
+            P_val = 1e-10
+        P_ret.append(P_val)
+
+    steps_arr = np.arange(1, steps+1)
+    x = np.log(steps_arr)
+    y = np.log(P_ret)
+    D_vals, centers = [], []
+    for i in range(len(steps_arr)-window+1):
+        xx = x[i:i+window]
+        yy = y[i:i+window]
+        slope, _ = np.polyfit(xx, yy, 1)
+        D_vals.append(-2*slope)
+        centers.append(np.mean(steps_arr[i:i+window]))
+    return centers, D_vals
+
+# Run for [1,1,1] with N=10000, θ=0.5
+N = 10000
+m_past, m_present, m_future = 1, 1, 1
+theta = 0.5
+
+A_p, A_pr, A_f = generate_events(N=N, m_past=m_past, m_present=m_present, m_future=m_future)
+G = build_thresholded_graph(A_p, A_pr, A_f, theta=theta)
+tri = count_triangles_exact(G)
+tri_density = tri / N
+centers, D_vals = spectral_dimension_flow(G, steps=20, trials=200, window=4)
+dev = np.mean(np.abs(np.array(D_vals) - 3))
+fitness = -dev + 5 * tri_density
+meanD = np.mean(D_vals)
+
+print(f"Parameters: past={m_past}, present={m_present}, future={m_future}, N={N}, theta={theta}")
+print(f"MeanD≈{meanD:.2f}, Dev≈{dev:.2f}, Tri≈{tri_density:.3f}, Fit≈{fitness:.3f}")
+
+# Plot flow
+plt.figure(figsize=(6,4))
+plt.plot(centers, D_vals, "o-", label="Dimensional flow")
+plt.axhline(3, color="red", linestyle="--", label="Target ~3")
+plt.xlabel("Scale (step length)")
+plt.ylabel("Effective Dimension")
+plt.title(f"Set: past=1, present=1, future=1, N=10000, θ=0.5\nTriangles/node={tri_density:.3f}, Fitness={fitness:.3f}")
+plt.legend()
+plt.savefig('flow_curve.png')
+print("Flow plot saved as flow_curve.png")
+
+# Export graph
+nx.write_gexf(G, "rho_graph.gexf")
+print("Exported graph to rho_graph.gexf")
